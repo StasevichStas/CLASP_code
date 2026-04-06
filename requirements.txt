@@ -9,3 +9,4 @@ numpy
 huggingface_hub
 transformers
 accelerate
+hdbscan

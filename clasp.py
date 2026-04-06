@@ -13,6 +13,10 @@ import pydensecrf.densecrf as dcrf
 from pydensecrf.utils import unary_from_softmax
 from transformers import AutoModel, AutoImageProcessor
 import timm
+import hdbscan
+from sklearn.decomposition import PCA
+import warnings
+
 
 
 # def load_dinov2_model(
@@ -61,7 +65,7 @@ def load_dinov2_model(model_name="dinov2_vitb14"):
         model.eval()
         
     else:
-        processor = AutoImageProcessor.from_pretrained(dinov3_names[model_name])# , token=''
+        processor = AutoImageProcessor.from_pretrained(dinov3_names[model_name], token='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')# , token=''
         model = AutoModel.from_pretrained(dinov3_names[model_name]).to(device)
         model.eval()
         model = (model, processor)
@@ -97,12 +101,12 @@ def extract_dinov3_features(model_bundle, img_tensor, device):
 
 
 @torch.no_grad()
-def compute_affinity_matrix(patch_descriptors, gamma=1, treshold=0):
+def compute_affinity_matrix(patch_descriptors, gamma=1, threshold=0):
 
     features = torch.nn.functional.normalize(patch_descriptors, p=2, dim=1)
     A = torch.mm(features, features.t())
     A = torch.relu(A)
-    A = torch.where(A > treshold, A, torch.zeros_like(A))
+    A = torch.where(A > threshold, A, torch.zeros_like(A))
     A = torch.pow(A, gamma)
     A.fill_diagonal_(0)
 
@@ -142,6 +146,56 @@ def find_elbow_point(delts):
     return k_optimal
 
 
+def find_clusters_hdbscan(patch_descriptors, min_cluster_size=5, min_samples=5):
+    """
+    min_cluster_size: Минимальное количество патчей, чтобы считать их объектом.
+                     Для ручейка на x2 апскейле 15-25 — хороший старт.
+    min_samples: Насколько консервативен алгоритм (чем меньше, тем больше шума 
+                 превращается в кластеры).
+    """
+    X = patch_descriptors.detach().cpu().numpy()
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric='euclidean', 
+        prediction_data=True
+    )
+    labels = clusterer.fit_predict(X)
+    num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    if -1 in labels:
+        labels[labels == -1] = num_clusters
+        num_clusters += 1
+        
+    return num_clusters, labels
+
+def evaluate_with_dbcv(X, labels):
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    
+    if isinstance(X, torch.Tensor):
+        X = X.detach().cpu().numpy()
+    
+    X = X.astype(np.float64)
+    
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    X_normalized = X / (norms + 1e-8) 
+
+    unique_labels = np.unique(labels)
+    if len(unique_labels[unique_labels != -1]) <= 1:
+        return -1.0
+
+    try:
+        pca = PCA(n_components=50)
+        X_for_score = pca.fit_transform(X_normalized)        
+        score = hdbscan.validity.validity_index(X_for_score, labels)
+        if np.isnan(score):
+            return -1.0
+            
+    except Exception as e:
+        # print(f"DBCV Error: {e}")
+        return -1.0
+        
+    return score
+
 def find_best_k(A, embeddings, k_opt, beta=0.2):
     """
     embeddings: собственные векторы [N_patches, k_opt]
@@ -153,7 +207,10 @@ def find_best_k(A, embeddings, k_opt, beta=0.2):
     ks = range(max(2, start_k), end_k + 1)
 
     best_s = -1
+    score_dbcv_best = -1
     best_k = k_opt
+    best_k_dbcv = k_opt
+    best_dbcv = -1
     best_clast = None
     X = embeddings.detach().cpu().numpy()
     A = A.detach().cpu().numpy()
@@ -163,12 +220,18 @@ def find_best_k(A, embeddings, k_opt, beta=0.2):
             A, n_clusters=k, assign_labels="discretize"
         )
         score = silhouette_score(X, labels, metric="cosine")
+        score_dbcv = evaluate_with_dbcv(X, labels)
+        if score_dbcv > best_dbcv:
+            best_dbcv = score_dbcv
+            best_k_dbcv = k
         if score > best_s:
             best_s = score
+            score_dbcv_best = score_dbcv
             best_k = k
             best_clast = labels
 
-    return best_k, best_clast, best_s
+
+    return best_k, best_k_dbcv, best_clast, best_s, score_dbcv_best
 
 
 def dense_crf(img, probs, sxy, compat):
@@ -205,7 +268,9 @@ def visualize_segmentation(
     masks_without_crf,
     pred_mask,
     num_clusters,
+    best_k_dbcvs,
     best_s,
+    best_dbcvs,
     img_id,
     save_dir,
 ):
@@ -228,13 +293,14 @@ def visualize_segmentation(
 
         plt.subplot(count_img, 3, 3 * i + 2)
         plt.imshow(orig_img[i])
-        plt.imshow(masks_without_crf[i], alpha=0.8, cmap="tab10")
-        plt.title(f"CLASP Prediction (K={num_clusters[i]}) sil_score={best_s[i]:.2f}")
+        plt.imshow(masks_without_crf[i], alpha=0.85, cmap="tab20")
+        plt.title(f"CLASP Prediction without CRF(K={num_clusters[i]}) ")
+        plt.axis("off")
 
         plt.subplot(count_img, 3, 3 * i + 3)
         plt.imshow(orig_img[i])
-        plt.imshow(pred_mask[i], alpha=0.8, cmap="tab10")
-        plt.title(f"CLASP Prediction with CRF (K={num_clusters[i]}) sil_score={best_s[i]:.2f}")
+        plt.imshow(pred_mask[i], alpha=0.85, cmap="tab20")
+        plt.title(f"CLASP Prediction (K={num_clusters[i]}) sil_score={best_s[i]:.3f} dbcv(K={best_k_dbcvs[i]}) = {best_dbcvs[i]:.3f}")
         plt.axis("off")
     plt.suptitle(f"{param}", y=0.98)
 
@@ -244,7 +310,7 @@ def visualize_segmentation(
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     save_path = os.path.join(save_dir, f"{param}.png")
-    plt.savefig(save_path, bbox_inches="tight", dpi=250)
+    plt.savefig(save_path, bbox_inches="tight", dpi=350)
     plt.close(fig)
 
 
@@ -314,9 +380,10 @@ class CocoClaspDataset(Dataset):
 
 
 class SimpleDataset(Dataset):
-    def __init__(self, img_dir, patch_size):
+    def __init__(self, img_dir, patch_size, size_img):
         self.img_dir = img_dir
         self.patch_size = patch_size
+        self.size_img = int(size_img*2)
         self.img_names = []
         for f in os.listdir(img_dir):
             if f.lower().endswith(("png", "jpg", "jpeg")):
@@ -326,8 +393,8 @@ class SimpleDataset(Dataset):
         path = os.path.join(self.img_dir, self.img_names[index])
         image_pil = Image.open(path).convert("RGB")
         w, h = image_pil.size
-        new_w = (w // self.patch_size) * self.patch_size 
-        new_h = (h // self.patch_size) * self.patch_size
+        new_w = (w // self.patch_size) * self.patch_size *self.size_img //2
+        new_h = (h // self.patch_size) * self.patch_size*self.size_img //2
         transform = transforms.Compose(
             [
                 transforms.Resize((new_h, new_w)),
@@ -356,19 +423,20 @@ class SimpleDataset(Dataset):
 
 if __name__ == "__main__":
     parameters = {
-        "treshold": 0,
-        "gamma": 5,
-        "beta": 0.4,
+        'size_img':1.5,
+        "threshold": 0,
+        "gamma": 7,
+        "beta": 0.7,
         "max_k": 150,
         "sxy_crf": 1,
-        "compat_crf": 45,
-        "encoder": "dinov3_vitl16",
+        "compat_crf": 105,
+        "encoder": "dinov3_vitb16",
     }
     PATCH_SIZE = 16
     ann_file = "datasets/assets"
-    img_dir = "examples"
+    img_dir = "single"
     # dataset = CocoClaspDataset(img_dir, ann_file, PATCH_SIZE)
-    dataset = SimpleDataset(img_dir, PATCH_SIZE)
+    dataset = SimpleDataset(img_dir, PATCH_SIZE, parameters["size_img"])
     model, device = load_dinov2_model(model_name=parameters["encoder"])
 
     n = min(4, len(dataset))
@@ -378,6 +446,8 @@ if __name__ == "__main__":
     count_classes = []
     masks_without_crf = []
     best_ss = []
+    best_dbcvs = []
+    best_k_dbcvs = []
 
     for i in range(n):
         img = dataset[i]
@@ -394,22 +464,26 @@ if __name__ == "__main__":
             model, img["img_tensor"], device
         )
         A = compute_affinity_matrix(
-            patch_descriptors, parameters["gamma"], parameters["treshold"]
+            patch_descriptors, parameters["gamma"], parameters["threshold"]
         )
         _, delts = compute_eigengaps(A, parameters["max_k"])
         k_opt = find_elbow_point(delts)
-        best_k, labels, best_s = find_best_k(
+        best_k, best_k_dbcv, labels, best_s, best_dbcv = find_best_k(
             A, patch_descriptors, k_opt, parameters["beta"]
         )
+
+        # best_k, labels = find_clusters_hdbscan(patch_descriptors, min_cluster_size=3, min_samples=25)
+        # best_s = 0
+
         mask_small = labels.reshape(num_patches_h, num_patches_w)
 
         mask_tensor = torch.from_numpy(mask_small).float()[None, None, :, :]
+        orig_h, orig_w = img["img_orig"].shape[:2]
         full_mask = F.interpolate(
-            mask_tensor, size=(new_h, new_w), mode="nearest"
+            mask_tensor, size=(orig_h, orig_w), mode="nearest"
         )
         full_mask = full_mask.squeeze().byte().cpu().numpy()
 
-        orig_h, orig_w = img["img_orig"].shape[:2]
         mask_one_hot = np.zeros(
             (best_k, num_patches_h, num_patches_w), dtype=np.float32
         )
@@ -440,6 +514,8 @@ if __name__ == "__main__":
         count_classes.append(best_k)
         masks_without_crf.append(full_mask)
         best_ss.append(best_s)
+        best_dbcvs.append(best_dbcv)
+        best_k_dbcvs.append(best_k_dbcv)
 
     visualize_segmentation(
         n,
@@ -449,7 +525,9 @@ if __name__ == "__main__":
         masks_without_crf,
         mask_preds,
         count_classes,
+        best_k_dbcvs,
         best_ss,
+        best_dbcvs,
         None,
         "result_img",
     )
