@@ -61,7 +61,7 @@ def load_dinov2_model(model_name="dinov2_vitb14"):
         model.eval()
         
     else:
-        processor = AutoImageProcessor.from_pretrained(dinov3_names[model_name], token='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')
+        processor = AutoImageProcessor.from_pretrained(dinov3_names[model_name])# , token=''
         model = AutoModel.from_pretrained(dinov3_names[model_name]).to(device)
         model.eval()
         model = (model, processor)
