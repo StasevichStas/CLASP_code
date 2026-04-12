@@ -1,103 +1,15 @@
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
-from pycocotools.coco import COCO
-from torchvision import transforms
-import os
-from PIL import Image
-import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.cluster import spectral_clustering
-from sklearn.metrics import silhouette_score
-import pydensecrf.densecrf as dcrf
-from pydensecrf.utils import unary_from_softmax
-from transformers import AutoModel, AutoImageProcessor
-import timm
-import hdbscan
-from sklearn.decomposition import PCA
-import warnings
 
 
-
-# def load_dinov2_model(
-#     repo_name="facebookresearch/dinov2", model_name="dinov2_vitb14"
-# ):
-#     print(f"Загрузка модели {model_name} из torch.hub...")
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     model = torch.hub.load(repo_name, model_name)
-#     model.eval()
-#     model.to(device)
-#     print(f"Модель загружена на {device}.")
-#     return model, device
-
-
-def load_dinov2_model(model_name="dinov2_vitb14"):
-
-    print(f"Загрузка модели {model_name} ...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    timm_names = {
-        "dinov2_vits14": "vit_small_patch14_dinov2",
-        "dinov2_vitb14": "vit_base_patch14_dinov2",
-        "dinov2_vitl14": "vit_large_patch14_dinov2",
-    }
-    dinov3_names = {
-        "dinov3_vitb16": "facebook/dinov3-vitb16-pretrain-lvd1689m",
-        "dinov3_vitl16": "facebook/dinov3-vitl16-pretrain-lvd1689m"
-    }
-
-    if model_name in timm_names:
-        timm_name = timm_names.get(model_name, "vit_base_patch14_dinov2")
-        model = timm.create_model(
-            timm_name,
-            pretrained=True,
-            num_classes=0,
-            global_pool="",
-            dynamic_img_size=True,
-        )
-
-        if not hasattr(model, "mask_token"):
-            model.mask_token = torch.nn.Parameter(
-                torch.zeros(1, 1, model.embed_dim)
-            )
-
-        model = model.to(device)
-        model.eval()
-        
-    else:
-        processor = AutoImageProcessor.from_pretrained(dinov3_names[model_name], token='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')# , token=''
-        model = AutoModel.from_pretrained(dinov3_names[model_name]).to(device)
-        model.eval()
-        model = (model, processor)
-    
-    return model, device
-
-
-@torch.no_grad()
-def extract_dinov2_features(model, device, img_tensor):
-    img_tensor = img_tensor
-    if img_tensor.ndim == 3:
-        img_tensor = img_tensor.unsqueeze(0)
-
-    # Модель теперь выдает [1, 1370, 768]
-    out = model(img_tensor)
-
-    # Отрезаем CLS-токен (первый), оставляем только патчи [1369, 768]
-    if out.ndim == 3 and out.shape[1] > 1:
-        out = out[:, 1:, :]
-    out = out.squeeze(0)
-    return  out #[N_patches, Dim]
-
-def extract_dinov3_features(model_bundle, img_tensor, device):
-    model, _ = model_bundle 
-    if img_tensor.ndim == 3:
-        img_tensor = img_tensor.unsqueeze(0)    
-    img_tensor = img_tensor.to(device)
-    outputs = model(img_tensor) 
-    features = outputs.last_hidden_state.squeeze(0)    
-    patch_features = features[5:, :] 
-    
-    return patch_features
+from tools import (
+    clustering_methods,
+    datasets,
+    models,
+    post_processing,
+    visualize,
+)
 
 
 @torch.no_grad()
@@ -118,16 +30,19 @@ def compute_eigengaps(A, max_k=50):
     """
     Выполняет спектральное разложение и
     считает зазоры между собственными значениями.
-    A: Матрица сходства [N, N]
-    max_k: Сколько первых значений проверяем (обычно 50 достаточно для COCO)
+    Args:
+        A: Матрица сходства [N, N]
+        max_k: Сколько первых значений проверяем (обычно 50 достаточно для COCO)
+    Returns:
+        eigenvalues, delta
     """
     eigenvalues, _ = torch.linalg.eigh(A)
     eigenvalues = torch.flip(eigenvalues, dims=[0])
     # eigenvectors = torch.flip(eigenvectors, dims=[1])
-    vals = eigenvalues[:max_k]
+    eigenvalues = eigenvalues[:max_k]
     # vecs = eigenvectors[:, :max_k]
-    delta = vals[:-1] - vals[1:]
-    return vals, delta
+    delta = eigenvalues[:-1] - eigenvalues[1:]
+    return eigenvalues, delta
 
 
 def find_elbow_point(delts):
@@ -146,298 +61,25 @@ def find_elbow_point(delts):
     return k_optimal
 
 
-def find_clusters_hdbscan(patch_descriptors, min_cluster_size=5, min_samples=5):
-    """
-    min_cluster_size: Минимальное количество патчей, чтобы считать их объектом.
-                     Для ручейка на x2 апскейле 15-25 — хороший старт.
-    min_samples: Насколько консервативен алгоритм (чем меньше, тем больше шума 
-                 превращается в кластеры).
-    """
-    X = patch_descriptors.detach().cpu().numpy()
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        metric='euclidean', 
-        prediction_data=True
-    )
-    labels = clusterer.fit_predict(X)
-    num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    if -1 in labels:
-        labels[labels == -1] = num_clusters
-        num_clusters += 1
-        
-    return num_clusters, labels
-
-def evaluate_with_dbcv(X, labels):
-    warnings.filterwarnings("ignore", category=RuntimeWarning)
-    
-    if isinstance(X, torch.Tensor):
-        X = X.detach().cpu().numpy()
-    
-    X = X.astype(np.float64)
-    
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    X_normalized = X / (norms + 1e-8) 
-
-    unique_labels = np.unique(labels)
-    if len(unique_labels[unique_labels != -1]) <= 1:
-        return -1.0
-
-    try:
-        pca = PCA(n_components=50)
-        X_for_score = pca.fit_transform(X_normalized)        
-        score = hdbscan.validity.validity_index(X_for_score, labels)
-        if np.isnan(score):
-            return -1.0
-            
-    except Exception as e:
-        # print(f"DBCV Error: {e}")
-        return -1.0
-        
-    return score
-
-def find_best_k(A, embeddings, k_opt, beta=0.2):
-    """
-    embeddings: собственные векторы [N_patches, k_opt]
-    k_opt: найденный ранее "локоть"
-    beta: ширина поиска
-    """
-    start_k = int(np.floor(k_opt * (1 - beta)))
-    end_k = int(np.ceil(k_opt * (1 + beta)))
-    ks = range(max(2, start_k), end_k + 1)
-
-    best_s = -1
-    score_dbcv_best = -1
-    best_k = k_opt
-    best_k_dbcv = k_opt
-    best_dbcv = -1
-    best_clast = None
-    X = embeddings.detach().cpu().numpy()
-    A = A.detach().cpu().numpy()
-
-    for k in ks:
-        labels = spectral_clustering(
-            A, n_clusters=k, assign_labels="discretize"
-        )
-        score = silhouette_score(X, labels, metric="cosine")
-        score_dbcv = evaluate_with_dbcv(X, labels)
-        if score_dbcv > best_dbcv:
-            best_dbcv = score_dbcv
-            best_k_dbcv = k
-        if score > best_s:
-            best_s = score
-            score_dbcv_best = score_dbcv
-            best_k = k
-            best_clast = labels
-
-
-    return best_k, best_k_dbcv, best_clast, best_s, score_dbcv_best
-
-
-def dense_crf(img, probs, sxy, compat):
-    """
-    img: исходное изображение (H, W, 3) тип uint8
-    probs: вероятности классов от модели (C, H, W) тип float32
-    """
-
-    img = np.ascontiguousarray(img)
-    probs = np.ascontiguousarray(probs)
-
-    c, h, w = probs.shape
-
-    d = dcrf.DenseCRF2D(w, h, c)
-    unary = unary_from_softmax(probs.astype(np.float32))
-    d.setUnaryEnergy(unary)
-
-    d.addPairwiseGaussian(sxy=(sxy, sxy), compat=3)
-
-    d.addPairwiseBilateral(
-        sxy=(80, 80), srgb=(13, 13, 13), rgbim=img, compat=10
-    )
-
-    q = d.inference(10)
-
-    return np.array(q).reshape((c, h, w))
-
-
-def visualize_segmentation(
-    count_img,
-    parameters,
-    orig_img,
-    gt_mask,
-    masks_without_crf,
-    pred_mask,
-    num_clusters,
-    best_k_dbcvs,
-    best_s,
-    best_dbcvs,
-    img_id,
-    save_dir,
-):
-
-    count_img
-    param = "".join([f"{key}:{val}  " for key, val in parameters.items()])
-    fig = plt.figure(figsize=(15, 4 * count_img))
-
-    for i in range(count_img):
-        plt.subplot(count_img, 3, 3 * i + 1)
-        plt.imshow(orig_img[i])
-        plt.title("Original Image")
-        plt.axis("off")
-
-        # plt.subplot(1, 2, 2)
-        # plt.imshow(orig_img)
-        # plt.imshow(gt_mask, alpha=0.7, cmap="tab20")
-        # plt.title("COCO Ground Truth")
-        # plt.axis("off")
-
-        plt.subplot(count_img, 3, 3 * i + 2)
-        plt.imshow(orig_img[i])
-        plt.imshow(masks_without_crf[i], alpha=0.85, cmap="tab20")
-        plt.title(f"CLASP Prediction without CRF(K={num_clusters[i]}) ")
-        plt.axis("off")
-
-        plt.subplot(count_img, 3, 3 * i + 3)
-        plt.imshow(orig_img[i])
-        plt.imshow(pred_mask[i], alpha=0.85, cmap="tab20")
-        plt.title(f"CLASP Prediction (K={num_clusters[i]}) sil_score={best_s[i]:.3f} dbcv(K={best_k_dbcvs[i]}) = {best_dbcvs[i]:.3f}")
-        plt.axis("off")
-    plt.suptitle(f"{param}", y=0.98)
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    # plt.show()
-
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    save_path = os.path.join(save_dir, f"{param}.png")
-    plt.savefig(save_path, bbox_inches="tight", dpi=350)
-    plt.close(fig)
-
-
-class CocoClaspDataset(Dataset):
-    def __init__(self, img_dir, ann_file, patch_size):
-        self.patch_size = patch_size
-        if ann_file is not None:
-            self.coco = COCO(ann_file)
-        else:
-            self.coco = ann_file
-        self.img_dir = img_dir
-        self.ids = list(self.coco.imgs.keys())
-
-    def __getitem__(self, index):
-        img_id = self.ids[index]
-        img_info = self.coco.loadImgs(img_id)[0]
-
-        f_name = img_info.get("file_name") or os.path.basename(
-            img_info.get("coco_url", "")
-        )
-
-        if not f_name:
-            raise KeyError(
-                f"Не нашел ни file_name, ни coco_url в img_info: {img_info}"
-            )
-
-        path = os.path.join(self.img_dir, f_name)
-        image_pil = Image.open(path).convert("RGB")
-        w, h = image_pil.size
-        new_w = (w // self.patch_size) * self.patch_size
-        new_h = (h // self.patch_size) * self.patch_size
-
-        ann_ids = self.coco.getAnnIds(imgIds=img_id)
-        anns = self.coco.loadAnns(ann_ids)
-
-        gt_mask = np.zeros((h, w), dtype=np.int32)
-        for i, ann in enumerate(anns):
-            if isinstance(ann["segmentation"], dict):
-                return self.__getitem__((index + 1) % len(self))
-            mask = self.coco.annToMask(ann)
-            gt_mask[mask > 0] = i + 1
-
-        transform = transforms.Compose(
-            [
-                transforms.Resize((new_h, new_w)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                ),
-            ]
-        )
-        image_tensor = transform(image_pil)
-
-        return {
-            "img_tensor": image_tensor,
-            "img_orig": np.array(image_pil),
-            "gt_mask": gt_mask,
-            "img_id": img_id,
-            "w": w,
-            "h": h,
-            "new_w": new_w,
-            "new_h": new_h,
-        }
-
-    def __len__(self):
-        return len(self.ids)
-
-
-class SimpleDataset(Dataset):
-    def __init__(self, img_dir, patch_size, size_img):
-        self.img_dir = img_dir
-        self.patch_size = patch_size
-        self.size_img = int(size_img*2)
-        self.img_names = []
-        for f in os.listdir(img_dir):
-            if f.lower().endswith(("png", "jpg", "jpeg")):
-                self.img_names.append(f)
-
-    def __getitem__(self, index):
-        path = os.path.join(self.img_dir, self.img_names[index])
-        image_pil = Image.open(path).convert("RGB")
-        w, h = image_pil.size
-        new_w = (w // self.patch_size) * self.patch_size *self.size_img //2
-        new_h = (h // self.patch_size) * self.patch_size*self.size_img //2
-        transform = transforms.Compose(
-            [
-                transforms.Resize((new_h, new_w)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                ),
-            ]
-        )
-        image_tensor = transform(image_pil)
-        return {
-            "img_tensor": image_tensor,
-            "img_pil":image_pil,
-            "img_orig": np.array(image_pil),
-            "gt_mask": None,
-            "img_id": self.img_names[index],
-            "w": w,
-            "h": h,
-            "new_w": new_w,
-            "new_h": new_h,
-        }
-
-    def __len__(self):
-        return len(self.img_names)
-
-
 if __name__ == "__main__":
     parameters = {
-        'size_img':1.5,
-        "threshold": 0,
-        "gamma": 7,
-        "beta": 0.7,
+        "size_img": 1.5,
+        "threshold": 0.0,
+        "gamma": 5,
+        "beta": 0.5,
         "max_k": 150,
-        "sxy_crf": 1,
-        "compat_crf": 105,
-        "encoder": "dinov3_vitb16",
+        "sxy_crf": 3,
+        "compat_crf": 15,
+        "encoder": "dinov2_vitb14",
     }
-    PATCH_SIZE = 16
+    PATCH_SIZE = 14
     ann_file = "datasets/assets"
-    img_dir = "single"
-    # dataset = CocoClaspDataset(img_dir, ann_file, PATCH_SIZE)
-    dataset = SimpleDataset(img_dir, PATCH_SIZE, parameters["size_img"])
-    model, device = load_dinov2_model(model_name=parameters["encoder"])
+    img_dir = "examples"
+
+    model, device = models.load_dino_model(model_name=parameters["encoder"])
+    dataset = datasets.SimpleDataset(
+        img_dir=img_dir, patch_size=PATCH_SIZE, size_img=parameters["size_img"]
+    )
 
     n = min(4, len(dataset))
 
@@ -457,26 +99,24 @@ if __name__ == "__main__":
         num_patches_h = new_h // PATCH_SIZE
         num_patches = num_patches_w * num_patches_h
 
-        # patch_descriptors = extract_dino_features(
-        #     model, device, img["img_tensor"].unsqueeze(0)
-        # )
-        patch_descriptors = extract_dinov3_features(
-            model, img["img_tensor"], device
+        patch_features = models.extract_dino_features(
+            model, device, img["img_tensor"]
         )
         A = compute_affinity_matrix(
-            patch_descriptors, parameters["gamma"], parameters["threshold"]
+            patch_features, parameters["gamma"], parameters["threshold"]
         )
         _, delts = compute_eigengaps(A, parameters["max_k"])
         k_opt = find_elbow_point(delts)
-        best_k, best_k_dbcv, labels, best_s, best_dbcv = find_best_k(
-            A, patch_descriptors, k_opt, parameters["beta"]
+        labels, best_k, best_k_dbcv, best_s, best_dbcv = (
+            clustering_methods.find_best_k(
+                A, patch_features, k_opt, parameters["beta"]
+            )
         )
 
         # best_k, labels = find_clusters_hdbscan(patch_descriptors, min_cluster_size=3, min_samples=25)
         # best_s = 0
 
         mask_small = labels.reshape(num_patches_h, num_patches_w)
-
         mask_tensor = torch.from_numpy(mask_small).float()[None, None, :, :]
         orig_h, orig_w = img["img_orig"].shape[:2]
         full_mask = F.interpolate(
@@ -501,7 +141,7 @@ if __name__ == "__main__":
             .numpy()
         )
         original_image = np.ascontiguousarray(img["img_orig"])
-        refined_probs = dense_crf(
+        refined_probs = post_processing.dense_crf(
             original_image,
             full_mask_probs,
             parameters["sxy_crf"],
@@ -517,7 +157,7 @@ if __name__ == "__main__":
         best_dbcvs.append(best_dbcv)
         best_k_dbcvs.append(best_k_dbcv)
 
-    visualize_segmentation(
+    visualize.visualize_segmentation(
         n,
         parameters,
         img_origs,
@@ -531,13 +171,3 @@ if __name__ == "__main__":
         None,
         "result_img",
     )
-
-    # visualize_segmentation(
-    #     parameters,
-    #     img["img_orig"],
-    #     img["gt_mask"],
-    #     mask_pred,
-    #     best_k,
-    #     img["img_id"],
-    #     "result_img",
-    # )
