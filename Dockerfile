@@ -17,13 +17,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install git+https://github.com/lucasb-eyer/pydensecrf.git huggingface_hub accelerate
 
 # RUN python3 -c "import timm; timm.create_model('vit_base_patch14_dinov2', pretrained=True)"
-ENV HF_TOKEN=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 
+ARG HF_TOKEN
+ENV HF_TOKEN=$HF_TOKEN
 
 RUN python3 -c "import timm; \
+timm.create_model('vit_small_patch14_dinov2', pretrained=True); \
 timm.create_model('vit_base_patch14_dinov2', pretrained=True); \
 timm.create_model('vit_large_patch14_dinov2', pretrained=True)"
 
 RUN python3 -c "from transformers import pipeline; \
+pipeline(model='facebook/dinov3-vits16-pretrain-lvd1689m', task='image-feature-extraction'); \
 pipeline(model='facebook/dinov3-vitb16-pretrain-lvd1689m', task='image-feature-extraction'); \
 pipeline(model='facebook/dinov3-vitl16-pretrain-lvd1689m', task='image-feature-extraction')"
 

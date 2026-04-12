@@ -100,14 +100,14 @@ if __name__ == "__main__":
         num_patches = num_patches_w * num_patches_h
 
         patch_features = models.extract_dino_features(
-            model, device, img["img_tensor"]
+            model, device, img["img_tensor"], model_type=parameters['encoder']
         )
         A = compute_affinity_matrix(
             patch_features, parameters["gamma"], parameters["threshold"]
         )
         _, delts = compute_eigengaps(A, parameters["max_k"])
         k_opt = find_elbow_point(delts)
-        labels, best_k, best_k_dbcv, best_s, best_dbcv = (
+        labels, best_k, best_k_dbcv, best_s, best_dbcv, best_score_dbcv  = (
             clustering_methods.find_best_k(
                 A, patch_features, k_opt, parameters["beta"]
             )
