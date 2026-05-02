@@ -4,6 +4,7 @@ pycocotools
 matplotlib
 scikit-learn
 opencv-python-headless
+pandas
 pillow
 numpy
 huggingface_hub

@@ -22,7 +22,7 @@ def dense_crf(img, probs, sxy, compat):
     d.addPairwiseGaussian(sxy=(sxy, sxy), compat=compat)
 
     d.addPairwiseBilateral(
-        sxy=(80, 80), srgb=(13, 13, 13), rgbim=img, compat=compat*3
+        sxy=(60, 60), srgb=(25, 25, 25), rgbim=img, compat=compat
     )
 
     q = d.inference(10)
